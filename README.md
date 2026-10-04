@@ -401,6 +401,20 @@ None of these produced a lock-up. ✔
 | Hand the renderer a final `http://` URL (resolve redirects, no HTTPS) or proxy the stream | §4.5 |
 | Listen to SSDP NOTIFY rather than relying on M-SEARCH only | §3; Music Assistant searches every 300 s only [10] |
 
+### async_upnp_client (used by Home Assistant `dlna_dmr` and Music Assistant)
+Both create `AiohttpSessionRequester(session, with_sleep=True)` with the library default timeout of
+5 s for every action [7][8][16]. Measured against an A5 with Music Assistant's live-source pacing and
+the first audio byte 3 s late (Play reply ~8 s), library 0.48.2: ✔
+- the Play request timed out and `AiohttpSessionRequester` **re-sent Play twice** (its retry loop
+  also catches timeouts); every re-sent Play **restarted the stream** on the speaker;
+- after ~17 s it raised `UpnpConnectionError: ("UpnpConnectionTimeoutError('TimeoutError()', None)", None)`,
+  the exact error in Music Assistant's log, while the speaker ended up playing;
+- aiohttp rounds timeouts ≥ 5 s up to the next whole second of its loop clock, so a Play reply of
+  5.3 s sometimes succeeds and sometimes not, matching "works after a few attempts".
+UPnP allows 30 s (UDA 1.1 §3.2.2). A library change giving DMR transport commands 30 s and not retrying
+timeouts (status polls keep 5 s) made the same start succeed with one Play after 8.4 s. ✔ (proposed
+upstream; link follows)
+
 ---
 
 ## 9. Open questions
