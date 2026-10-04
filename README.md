@@ -415,8 +415,8 @@ the first audio byte 3 s late (Play reply ~8 s), library 0.48.2: ✔
 - aiohttp rounds timeouts ≥ 5 s up to the next whole second of its loop clock, so a Play reply of
   5.3 s sometimes succeeds and sometimes not, matching "works after a few attempts".
 UPnP allows 30 s (UDA 1.1 §3.2.2). A library change giving DMR transport commands 30 s and not retrying
-timeouts (status polls keep 5 s) made the same start succeed with one Play after 8.4 s. ✔ (proposed
-upstream; link follows)
+timeouts (status polls keep 5 s) made the same start succeed with one Play after 8.4 s. ✔ Proposed
+upstream: [async_upnp_client#327](https://github.com/StevenLooman/async_upnp_client/pull/327).
 
 ---
 
