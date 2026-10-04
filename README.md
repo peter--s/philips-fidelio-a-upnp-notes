@@ -123,6 +123,9 @@ intervals. Listening to NOTIFY is more reliable.
 ### 4.2 Play, Pause, Stop
 - **The Play reply is sent only after playback has started.** Until then the UPnP interface answers
   no requests, including `Stop` and status polls. ✔
+  - Commands sent meanwhile are queued, not rejected: a `Pause` sent 1 s after `Play` was answered
+    0.1 s after the Play reply, i.e. after **4.5 s** (speaker on) and **10.0 s** (from standby, first
+    audio byte 3 s late), and was then applied (`PAUSED_PLAYBACK`). ✔
 - Playback starts once a codec-specific **amount of data** has arrived (A5 and A3 within ±2 %):
 
 | Stream | Data received when PLAYING | Typical Play reply at real-time delivery |
@@ -391,7 +394,7 @@ None of these produced a lock-up. ✔
 
 | Do | Because |
 |---|---|
-| Allow **≥ 35 s** for `Play` (and for `Stop` sent shortly after a Play) | §4.2, §4.3. Music Assistant's DLNA provider uses async_upnp_client's default of **5 s** [7][8] and fails starts, especially for live sources with only a 0.5 s opening burst [9] |
+| Allow **≥ 35 s** for `Play` and for any transport command (`Stop`, `Pause`, …) sent while a Play is pending | §4.2, §4.3. Music Assistant's DLNA provider uses async_upnp_client's default of **5 s** [7][8] and fails starts, especially for live sources with only a 0.5 s opening burst [9] |
 | Send a few seconds of audio ahead of real time at stream start | shortens the start from about 6 s to about 1.5 s |
 | Use one request at a time, without keep-alive | §4.1 |
 | Stream MP3, or 16-bit WAV ≤ 48 kHz, chunked | §4.4, §5 |
