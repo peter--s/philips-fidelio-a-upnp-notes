@@ -1,0 +1,11 @@
+# local network details - never publish
+radios.conf
+*.local.conf
+radio_diag.conf
+# generated test media, caches, results
+tools/media/
+__pycache__/
+*.pyc
+radio_diag/
+*.log
+*.csv
