@@ -489,3 +489,9 @@ Examples in this repository use documentation addresses (RFC 5737, `192.0.2.x`).
 21. What Hi-Fi, IFA 2012: Philips expands Fidelio wireless hi-fi range (A1/A2) — <https://www.whathifi.com/news/ifa-2012-philips-expands-fidelio-wireless-hi-fi-range>
 
 Music Assistant code references reflect the `dev` branch as of October 2026.
+
+## License
+- Code in `tools/`: [MIT](LICENSE).
+- Documentation (this README and other text): [CC BY 4.0](LICENSE-docs). Attribution: "philips-fidelio-a-upnp-notes" with a link to this repository.
+- Philips, Fidelio and Streamium are trademarks of their respective owners; this project is not affiliated with or endorsed by them.
+
