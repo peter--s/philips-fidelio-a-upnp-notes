@@ -9,3 +9,4 @@ __pycache__/
 radio_diag/
 *.log
 *.csv
+.venv/

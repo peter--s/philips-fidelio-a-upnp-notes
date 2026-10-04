@@ -176,7 +176,7 @@ A5 (measured 10.01–10.08 min in 8 idle periods; 5–20 s polling of `/HOMESTAT
 - The timeout is not configurable via any API (§6); volume and mute survive standby and wake-up. ✔
 - The device also **boots into standby**; standby exits automatically on Play. ✔
 
-**Wake-up latency** (MP3, real-time delivery; times from Play; RadioK = A5, RadioB = A3). ✔
+**Wake-up latency** (MP3, real-time delivery; times from Play; first value A5, second value A3). ✔
 
 | State before Play | first request (HEAD) | PLAYING |
 |---|---|---|
@@ -415,6 +415,22 @@ None of these produced a lock-up. ✔
 - The UPnP volume range (the SCPD was not read).
 
 ---
+
+## Requirements
+- **Python ≥ 3.10** with **aiohttp** (`requirements.txt`); `fidelio_discover.py` needs only the standard library.
+- **ffmpeg** to generate test signals: `libmp3lame` (MP3), `libopus` (Opus), built-in FLAC/ALAC/AAC/WMA/Vorbis
+  encoders; HE-AAC v1/v2 uses the macOS AudioToolbox encoder (`aac_at`), so only on macOS.
+- The test host must be on the speakers' LAN segment (SSDP multicast, speaker fetches streams from it)
+  and must not sleep during runs (`caffeinate -i` on macOS).
+- `tools/radio_diag.sh` (Home Assistant terminal add-on): bash ≥ 4, `curl`, `jq`, `ha` CLI, `timeout`,
+  `ping`; `python3` optional (discovery).
+
+```sh
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/python tools/fidelio_discover.py --save tools/radios.conf
+.venv/bin/python tools/dlna_probe.py --radio <name> --format mp3:44100
+```
 
 ## Tools
 
