@@ -38,7 +38,7 @@ while [ $# -gt 0 ]; do
     --capture) CAPTURE=$2; shift ;;
     --ha-debug) HA_DEBUG=$2; shift ;;
     --no-zip) DO_ZIP=0 ;;
-    -h|--help) sed -n '2,19p' "$0"; exit 0 ;;
+    -h|--help) awk 'NR > 1 && /^#/ { print; next } NR > 1 { exit }' "$0"; exit 0 ;;
     *) echo "unknown option: $1"; exit 2 ;;
   esac
   shift
