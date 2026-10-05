@@ -6,11 +6,15 @@
 #   /homeassistant/radio_diag.sh --recover Kitchen force recovery attempts on the radio "Kitchen"
 #   /homeassistant/radio_diag.sh --no-recover     diagnose only (read-only)
 #   /homeassistant/radio_diag.sh --discover       full SSDP discovery (60 s) before diagnosing
-#   further options: --no-logs  --no-ssdp  --no-discover
+#   /homeassistant/radio_diag.sh --capture 120    also record the radios' traffic for 120 s (tcpdump)
+#   /homeassistant/radio_diag.sh --ha-debug on    switch HA debug logging for DLNA/UPnP on (or off), then diagnose
+#   further options: --no-logs  --no-ssdp  --no-discover  --no-zip
 # Radios: "name address" lines in $RADIO_DIAG_CONF (default /homeassistant/radio_diag.conf).
 #   Created/updated automatically by discovery; entries not seen are kept, so a hung radio that no
 #   longer announces itself is still diagnosed with its last known address.
-# Results: /homeassistant/radio_diag/<date-time>/ (report.txt, logs, raw responses)
+# Results: /homeassistant/radio_diag/<date-time>/ (report.txt, logs, raw responses) and <date-time>.zip
+# States: OK, STUCK (PLAYING with frozen position, LED off: a Stop was refused with UPnP error 701
+#   while the stream connection stayed open; a second Stop clears it), UPNP-SILENT/HUNG, OFFLINE.
 
 CONF=${RADIO_DIAG_CONF:-/homeassistant/radio_diag.conf}
 RADIOS=()
@@ -18,7 +22,8 @@ MA_SLUG=d5369777_music_assistant
 UPNP_PORT=49153
 VENDOR_PORT=8889
 BLOCK_GRACE=45   # UPnP normally blocks up to ~30 s (wake from long standby, failed stream)
-MINUTES=30; RECOVER=1; FORCE=""; DO_LOGS=1; DO_SSDP=1; DISCOVER=quick
+MINUTES=30; RECOVER=1; FORCE=""; DO_LOGS=1; DO_SSDP=1; DISCOVER=quick; CAPTURE=0; HA_DEBUG=""; DO_ZIP=1
+PATCH_SCRIPT=/homeassistant/ma_patch_pr327.sh
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -30,7 +35,10 @@ while [ $# -gt 0 ]; do
     --no-ssdp) DO_SSDP=0 ;;
     --discover) DISCOVER=full ;;
     --no-discover) DISCOVER=none ;;
-    -h|--help) sed -n '2,14p' "$0"; exit 0 ;;
+    --capture) CAPTURE=$2; shift ;;
+    --ha-debug) HA_DEBUG=$2; shift ;;
+    --no-zip) DO_ZIP=0 ;;
+    -h|--help) sed -n '2,19p' "$0"; exit 0 ;;
     *) echo "unknown option: $1"; exit 2 ;;
   esac
   shift
@@ -49,9 +57,18 @@ rcdesc() {
   esac
 }
 redact() { sed -E 's#(https?://)[^/@ ]+@#\1***@#g'; }   # e.g. tokens in git URLs
-ha_api() {
+ha_api() {  # path [json body -> POST]
   [ -n "${SUPERVISOR_TOKEN:-}" ] || return 1
-  curl -s -m 15 -H "Authorization: Bearer $SUPERVISOR_TOKEN" "http://supervisor/core/api/$1"
+  if [ -n "${2:-}" ]; then
+    curl -s -m 15 -X POST -H "Authorization: Bearer $SUPERVISOR_TOKEN" -H 'Content-Type: application/json' \
+         -d "$2" "http://supervisor/core/api/$1"
+  else
+    curl -s -m 15 -H "Authorization: Bearer $SUPERVISOR_TOKEN" "http://supervisor/core/api/$1"
+  fi
+}
+conns() {  # ip -> TCP connections between this host (HA, MA, ...) and the radio
+  { ss -tn 2>/dev/null || netstat -tn 2>/dev/null; } | grep -E "[ :]$(echo "$1" | sed 's/\./\\./g'):[0-9]+( |$)" \
+    | awk '{print "      " $0}'
 }
 
 # --- requests to the radios: one at a time, never with a timeout below 10 s ------------
@@ -80,7 +97,7 @@ tcp() {
 
 declare -A STATUS
 diagnose() {  # name ip
-  local n=$1 ip=$2 p d drc vs s1
+  local n=$1 ip=$2 p d drc vs s1 st pos1
   say "=== $n ($ip)"
   if ping -c 3 -W 2 "$ip" >/dev/null 2>&1; then p=ok; else p=FAIL; fi
   say "  ping: $p   neighbour: $( (ip neigh show "$ip" 2>/dev/null || arp -n "$ip" 2>/dev/null) | head -1)"
@@ -102,14 +119,24 @@ diagnose() {  # name ip
   sleep 1
   soap "$ip" AVTransport GetTransportInfo; s1=$SOAP_RC
   if [ $s1 = 0 ]; then
-    say "  UPnP GetTransportInfo: HTTP $SOAP_CODE in ${SOAP_TIME}s, state=$(xml CurrentTransportState) status=$(xml CurrentTransportStatus)"
+    st=$(xml CurrentTransportState)
+    say "  UPnP GetTransportInfo: HTTP $SOAP_CODE in ${SOAP_TIME}s, state=$st status=$(xml CurrentTransportStatus)"
     sleep 1; soap "$ip" AVTransport GetMediaInfo
     say "  UPnP GetMediaInfo: uri=$(xml CurrentURI | sed 's/&amp;/\&/g')"
     sleep 1; soap "$ip" AVTransport GetPositionInfo
-    say "  UPnP GetPositionInfo: $(xml RelTime) / $(xml TrackDuration)"
+    pos1=$(xml RelTime)
+    say "  UPnP GetPositionInfo: $pos1 / $(xml TrackDuration)"
     sleep 1; soap "$ip" RenderingControl GetVolume "<InstanceID>0</InstanceID><Channel>Master</Channel>"
     say "  UPnP GetVolume: $(xml CurrentVolume)"
     STATUS[$n]="OK"
+    if [ "$st" = PLAYING ]; then
+      sleep 4; soap "$ip" AVTransport GetPositionInfo
+      if [ $SOAP_RC = 0 ] && [ "$(xml RelTime)" = "$pos1" ]; then
+        STATUS[$n]="STUCK: PLAYING but position frozen at $pos1 (LED off? stalled stream / refused Stop)"
+      else
+        say "  position advances ($pos1 -> $(xml RelTime))"
+      fi
+    fi
   else
     say "  UPnP GetTransportInfo: $(rcdesc $s1) after ${SOAP_TIME}s"
     if [ $p = FAIL ] && [ $drc != 0 ] && [ $vs != 0 ]; then
@@ -118,7 +145,26 @@ diagnose() {  # name ip
       STATUS[$n]="UPNP-SILENT"
     fi
   fi
+  say "  TCP connections with this host:"
+  conns "$ip" | tee "$OUT/$n-connections.txt"
+  [ -s "$OUT/$n-connections.txt" ] || say "      none"
   say "  -> ${STATUS[$n]}"
+}
+
+recover_stuck() {  # name ip: a Stop refused with 701 leaves PLAYING; a second Stop clears it
+  local n=$1 ip=$2 i
+  say "=== RECOVERY (stuck) $n ($ip)"
+  for i in 1 2 3; do
+    soap "$ip" AVTransport Stop
+    say "  Stop #$i: HTTP $SOAP_CODE in ${SOAP_TIME}s $(xml errorCode | sed 's/^./UPnP error &/')"
+    sleep 2; soap "$ip" AVTransport GetTransportInfo
+    if [ "$(xml CurrentTransportState)" != PLAYING ]; then
+      say "  -> $(xml CurrentTransportState). The LED stays off until the stream connection is closed"
+      say "     (by MA, e.g. when it starts the next stream); see the TCP connections above."
+      return 0
+    fi
+  done
+  return 1
 }
 
 recover() {  # name ip
@@ -244,6 +290,31 @@ say "radio_diag starting, output in $OUT"
 load_radios
 say "HA core: $(ha core info --raw-json 2>/dev/null | jq -r '.data.version // "?"')   MA app: $(ha apps info $MA_SLUG --raw-json 2>/dev/null | jq -c '.data | {version, state, watchdog}' 2>/dev/null)"
 say "host: $(uptime)"
+if [ -n "$HA_DEBUG" ]; then
+  lvl=warning; [ "$HA_DEBUG" = on ] && lvl=debug
+  if ha_api services/logger/set_level "{\"homeassistant.components.dlna_dmr\": \"$lvl\", \"async_upnp_client\": \"$lvl\", \"homeassistant.components.ssdp\": \"$lvl\"}" >/dev/null; then
+    say "HA debug logging for dlna_dmr / async_upnp_client / ssdp set to $lvl (until HA restarts)"
+  else
+    say "could not set HA log levels (no SUPERVISOR_TOKEN, or the logger integration is not loaded)"
+  fi
+fi
+if [ "$CAPTURE" -gt 0 ] 2>/dev/null; then
+  if command -v tcpdump >/dev/null 2>&1; then
+    filt=$(for r in "${RADIOS[@]}"; do set -- $r; printf 'host %s or ' "$2"; done); filt=${filt% or }
+    timeout "$CAPTURE" tcpdump -i any -w "$OUT/radios.pcap" $filt >/dev/null 2>&1 &
+    CAP_PID=$!
+    say "capturing the radios' traffic for $CAPTURE s -> radios.pcap"
+  else
+    say "tcpdump not available - capture skipped"
+  fi
+fi
+if [ -x "$PATCH_SCRIPT" ] && command -v docker >/dev/null 2>&1; then
+  for t in ma ha; do
+    "$PATCH_SCRIPT" status $t > "$OUT/patch_pr327_$t.txt" 2>&1 < /dev/null
+    say "async_upnp_client #327 patch ($t): $(grep -m1 'async_upnp_client [0-9]' "$OUT/patch_pr327_$t.txt" | cut -d' ' -f2)," \
+        "$(tail -n 1 "$OUT/patch_pr327_$t.txt")"
+  done
+fi
 free -m 2>/dev/null | sed 's/^/    /'
 
 say "--- HA media_player entities named Radio*"
@@ -310,6 +381,11 @@ fi
 if [ $RECOVER = 1 ]; then
   for r in "${RADIOS[@]}"; do
     set -- $r
+    if [ -z "$FORCE" ] && [ "${STATUS[$1]#STUCK}" != "${STATUS[$1]}" ]; then
+      if recover_stuck "$1" "$2"; then STATUS[$1]="${STATUS[$1]} -> cleared by a second Stop"
+      else STATUS[$1]="${STATUS[$1]} -> still PLAYING after 3 Stops"; fi
+      continue
+    fi
     if [ -n "$FORCE" ]; then [ "$1" = "$FORCE" ] || continue
     else case "${STATUS[$1]}" in HUNG*) ;; *) continue ;; esac; fi
     if recover "$1" "$2"; then STATUS[$1]="${STATUS[$1]} -> RECOVERED by software"
@@ -327,12 +403,20 @@ if [ $DO_LOGS = 1 ]; then
       ts >= f'
   }
   pat='dlna|ssdp|upnp|F00DBABE'
+  for r in "${RADIOS[@]}"; do set -- $r; pat="$pat|$1|$(echo "$2" | sed 's/\./\\./g')"; done
   ha core logs -n 50000 2>&1 | win | redact > "$OUT/ha_core.log"
   grep -iE "$pat" "$OUT/ha_core.log" > "$OUT/ha_core_radios.log"
-  ha apps logs $MA_SLUG -n 50000 2>&1 | win | redact > "$OUT/music_assistant.log"
-  grep -iE "$pat|play_media|Flow stream|unavailable|not available|error" "$OUT/music_assistant.log" > "$OUT/music_assistant_radios.log"
+  ha apps logs $MA_SLUG -n 50000 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | redact > "$OUT/music_assistant_full.log"
+  win < "$OUT/music_assistant_full.log" > "$OUT/music_assistant.log"
+  grep -iE "$pat|play_media|Flow stream|unavailable|not available|error|Spotify Connect|librespot|stalled|Stopping player|took [0-9.]+ seconds" \
+    "$OUT/music_assistant.log" > "$OUT/music_assistant_radios.log"
+  lv=$(grep -oE '\[music_assistant\.[^]]+\] Log level configured to [A-Z]+' "$OUT/music_assistant_full.log" | sort -u \
+       | sed -E 's/\[music_assistant\.([^]]+)\] Log level configured to /\1=/' | tr '\n' ' ')
+  say "    MA providers with a non-default log level (since MA start): ${lv:-none}"
+  echo "$lv" | grep -q 'DLNA=DEBUG' || say "    hint: set the DLNA provider's log level to debug in MA (Settings > Providers > DLNA)"
   ha supervisor logs -n 5000 2>&1 | win | redact > "$OUT/supervisor.log"
   ha host logs -n 5000 2>&1 | redact | grep -iE 'out of memory|oom|killed process' > "$OUT/host_oom.log"
+  rm -f "$OUT/music_assistant_full.log"
   for f in ha_core ha_core_radios music_assistant music_assistant_radios supervisor host_oom; do
     say "    $f.log: $(wc -l < "$OUT/$f.log") lines"
   done
@@ -343,4 +427,21 @@ fi
 
 say "=== SUMMARY"
 for r in "${RADIOS[@]}"; do set -- $r; say "    $1 ($2): ${STATUS[$1]}"; done
+if [ -n "${CAP_PID:-}" ]; then
+  say "waiting for the packet capture to finish..."; wait "$CAP_PID" 2>/dev/null
+  say "    radios.pcap: $(du -h "$OUT/radios.pcap" 2>/dev/null | cut -f1)"
+fi
 say "all files: $OUT"
+if [ $DO_ZIP = 1 ]; then
+  sleep 1   # let tee flush report.txt
+  zip_out="$OUT.zip"
+  if command -v zip >/dev/null 2>&1; then
+    (cd "$(dirname "$OUT")" && zip -qr "$zip_out" "$(basename "$OUT")")
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 -c "import shutil,sys; shutil.make_archive(sys.argv[1][:-4], 'zip', sys.argv[2], sys.argv[3])" \
+      "$zip_out" "$(dirname "$OUT")" "$(basename "$OUT")"
+  else
+    zip_out="$OUT.tar.gz"; tar -czf "$zip_out" -C "$(dirname "$OUT")" "$(basename "$OUT")"
+  fi
+  [ -s "$zip_out" ] && say "archive: $zip_out ($(du -h "$zip_out" | cut -f1))" || say "archive could not be created"
+fi
