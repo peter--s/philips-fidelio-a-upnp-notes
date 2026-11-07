@@ -38,7 +38,8 @@ attributable to Wi-Fi reception. ✔
 | Twonky quirk flags for the Fidelio A9 [11] | `SUBSCRIBE_TWICE`, `POLL_AVT_STATE`, `NEEDS_STOP_4_AV`, `IGNORE_STOP_AFTER_PLAY`, `ACCEPT_SAME_SEQ`, seek flags | None of these behaviours observed on the A5; Seek unsupported anyway (§4.1, §4.2) |
 | SSDP | – | Announcement interval and origin, boot sequence (§3) |
 | Vendor API :8889 | Paths for standby, volume, sources used by homebridge-fidelio [5] | Response formats, **bass/treble control**, further settings, Wi-Fi status, no auto-standby setting (§6) |
-| Robustness | Users report occasional lock-ups needing a power cycle | Not reproducible by load, parallelism, dead subscribers, abandoned requests or standby wake-ups (§7) |
+| Robustness | Users report occasional lock-ups needing a power cycle | Not reproducible by load, parallelism, dead subscribers, abandoned requests or standby wake-ups; a stuck state caused by a stream ended without closing the connection; one field lock-up captured and cleared without a power cycle by closing Music Assistant's stream connection (§4.6, §7) |
+| Status LED | Manual: colours for setup, standby, mute | Blink rate separates buffering from mute; LED off marks the stuck/hung state (§4.6) |
 | Controller interaction | – | Why Music Assistant's DLNA provider times out on these devices (§8) |
 
 ---
@@ -246,6 +247,39 @@ mention only built-in internet radio and app fixes [4]; BubbleUPnP later added i
 renderer never handled them; plain-HTTP remote URLs, common in 2013, worked, and fail today mostly
 because services moved to HTTPS and redirecting entry URLs.
 
+### 4.6 Stream stalls, stream end, the stuck state and the status LED
+The power button LED, as documented [22] and as observed (A5):
+
+| LED | Meaning |
+|---|---|
+| solid white | on, ready or playing |
+| blinking white, about 1 Hz | buffering: at start, and whenever the stream delivers no data (observed) |
+| blinking white, about 0.5 Hz | muted (manual: "blinking white") |
+| solid green | standby |
+| **off** | the stuck state below, and the field lock-up in §7 (observed; not in the manual) |
+
+**A stream that stalls with the connection open** (no data, no end): the renderer keeps reporting
+`PLAYING` with a frozen position, the LED blinks, and about **30–31 s after the last data byte** it
+switches to `STOPPED` by itself. ✔ A `Stop` sent during the stall is answered only at that 30 s point,
+and every other request waits behind it (status polls time out in controllers that allow 5 s). ✔
+Ending the stream first (terminating chunk and connection close, or a reset) makes it stop at once; a
+`Stop` then takes under 0.1 s. ✔
+
+**The stuck state.** If the last data arrives after a stall, followed by the terminating chunk
+`0\r\n\r\n` in a **separate packet** about 30 ms later, the TCP connection is **not closed**, and a
+`Stop` follows about 60 ms later, the `Stop` is held for 30 s and then answered with **HTTP 500, UPnP
+error 701**. The renderer stays in `PLAYING` with a frozen position, silent, **LED off**, without
+reaching auto-standby (observed for more than 12 minutes). ✔ This happened in 5 of 7 attempts on two
+A5s; with the last data and the terminating chunk in one packet, 2 of 2 attempts stopped
+normally (the last data was played). ✔
+- A **second `Stop`** is answered in under 0.25 s and gives `STOPPED`. ✔
+- The player part stays stuck (LED off, `/ELAPSE` still `play:1`) until the **stream connection is
+  closed**; then the LED returns to white and `/ELAPSE` to idle. ✔
+- Music Assistant produces exactly this pattern with Spotify Connect: a pause in the Spotify app stops
+  the audio, 20 s later Music Assistant reports the source as stalled, sends the last data and the
+  terminating chunk, keeps the connection open despite its own `Connection: close` header, and sends
+  `Stop` (packet capture). ✔
+
 ---
 
 ## 5. Format support (UPnP streaming, A5; A3 identical where tested)
@@ -383,10 +417,29 @@ None of these produced a lock-up. ✔
 | Play abandoned after 5 s with an immediate Stop / SetAVTransportURI / Play retry, 5 rounds | Stop is blocked as well; recovers on its own |
 | Standby → wake with controller-style retries and parallel polls; first play after power-on | slow, but recovers on its own |
 
-- Field lock-ups (the speaker stays unusable until power-cycled) **remain unexplained**.
 - A blocked device (pending Play or wake-up) can be told apart from a hung one: UPnP stays silent for
   at most about 30 s while ping, TCP 49153 and `/HOMESTATUS` keep answering. Silence beyond about 45 s
   is a hang candidate. ⚠ The threshold is derived, not taken from a captured hang.
+
+**One field lock-up was captured** (A5, November 2026; previous such lock-ups had been ended by a power
+cycle). It looked different from the candidate above: ✔
+
+| Check | Result while hung |
+|---|---|
+| LED | off |
+| Ping, UPnP description, UPnP actions | answered in under 0.15 s; `STOPPED` |
+| Port 8889 (web UI, `/HOMESTATUS`) | TCP connection accepted, request acknowledged, **no response** (60 s) |
+| `Stop` | 200, no change |
+| `SetAVTransportURI` + `Play` of a working stream | `Play` fails with **UPnP error 501 after 30 s**; the stream is **never requested** |
+| Music Assistant's stream connection to the renderer | still open, no traffic |
+
+Preceding it: two Music Assistant announcements 37 s apart, with a library that re-sent timed-out
+commands (§8), then timeouts of `play_media` and `volume_set`. The trigger is not established.
+- `Stop`, a working stream, and closing the connection on the controller host with `ss -K` (not
+  supported there) did not help.
+- **Restarting Music Assistant** closed its connection: the LED came on, port 8889 answered again, and a
+  stream played normally. ✔ One occurrence; about 20 minutes passed between the last failed attempt and
+  the restart, so a delayed self-recovery is not excluded. ⚠
 
 ---
 
@@ -403,6 +456,9 @@ None of these produced a lock-up. ✔
 | To get a working Pause, put `DLNA.ORG_OP=01` into the DIDL `protocolInfo`, and keep the HTTP stream open (and buffered) while paused; don't use Seek | §4.2 |
 | Hand the renderer a final `http://` URL (resolve redirects, no HTTPS) or proxy the stream | §4.5 |
 | Listen to SSDP NOTIFY rather than relying on M-SEARCH only | §3; Music Assistant searches every 300 s only [10] |
+| Close the connection when a stream ends; don't leave it open after the terminating chunk | §4.6: a `Stop` then gets UPnP error 701 and the renderer stays stuck (LED off) |
+| Send a UPnP `Pause` when the source pauses, instead of letting the stream run dry; and send `Stop` again after error 701 | §4.2, §4.6 |
+| As a user: when the LED is off and `Play` fails, check `ss -tn` for an open connection from the speaker to the controller and restart the controller before power-cycling the speaker | §7 |
 
 ### async_upnp_client (used by Home Assistant `dlna_dmr` and Music Assistant)
 Both create `AiohttpSessionRequester(session, with_sleep=True)` with the library default timeout of
@@ -415,14 +471,19 @@ the first audio byte 3 s late (Play reply ~8 s), library 0.48.2: ✔
 - aiohttp rounds timeouts ≥ 5 s up to the next whole second of its loop clock, so a Play reply of
   5.3 s sometimes succeeds and sometimes not, matching "works after a few attempts".
 UPnP allows 30 s (UDA 1.1 §3.2.2). A library change giving DMR transport commands 30 s and not retrying
-timeouts (status polls keep 5 s) made the same start succeed with one Play after 8.4 s. ✔ Proposed
-upstream: [async_upnp_client#327](https://github.com/StevenLooman/async_upnp_client/pull/327).
+timeouts (status polls keep 5 s) made the same start succeed with one Play after 8.4 s. ✔ This change,
+[async_upnp_client#327](https://github.com/StevenLooman/async_upnp_client/pull/327), was merged on
+7 Oct 2026 and released in **0.49.0** (11 Oct 2026). Home Assistant 2026.11.0 ships 0.49.0;
+Music Assistant 2.10.9 still pins 0.48.0 and is affected. ✔
 
 ---
 
 ## 9. Open questions
-- Cause of the field lock-ups, and whether software recovery works (candidates: UPnP Stop, `/mp3link`,
-  standby off/on). `tools/radio_diag.sh` captures the state and tries those steps.
+- The trigger of the field lock-up (§7), whether every lock-up shows the same signature (UPnP alive, port
+  8889 silent, controller connection open), and whether restarting the controller clears it every time.
+  `tools/radio_diag.sh` detects this state and tries that recovery.
+- After the lock-up, `/ELAPSE` reported volume 29 while UPnP `GetVolume` reported 16 (they normally
+  match).
 - A1, A2 and A9: untested. A1/A2 likely behave like A3/A5 as renderers; firmware H5.10S was released jointly for AW9000, AW5000, AW3000,
   AW2000 and AW1000 (release notes, via search summary) [4]. ⚠
   The A9 (AW9000) appears to differ [11].
@@ -480,7 +541,10 @@ Examples in this repository use documentation addresses (RFC 5737, `192.0.2.x`).
 - `tools/remote_test.py`: local vs. remote, HTTP vs. HTTPS and redirect URLs.
 - `tools/relay_test.py`: relays a real internet-radio stream to the renderer, re-framed chunked or unchanged.
 - `tools/radio_diag.sh`: Home Assistant terminal script to run when a speaker hangs. It diagnoses all
-  channels, collects HA and Music Assistant logs, and attempts recovery.
+  channels, collects HA and Music Assistant logs, and attempts recovery: a second `Stop` for the stuck
+  state, and for a hung player with an open Music Assistant stream connection it saves the connections
+  and the MA log, then restarts the MA container (`--no-ma-restart` to skip, `--no-recover` for a
+  read-only run). Each run is zipped.
 
 ## References
 1. Philips AW5000/10 product leaflet — <https://www.documents.philips.com/assets/20231128/71e02c3cd6fc474ea9f3b0c800795d86.pdf>
@@ -504,6 +568,7 @@ Examples in this repository use documentation addresses (RFC 5737, `192.0.2.x`).
 19. Philips Fidelio A1 wireless Hi-Fi link AW1000/10 — <https://www.philips.co.uk/c-p/AW1000_10/fidelio-a1-wireless-hi-fi-link>
 20. Philips Fidelio A2 wireless Hi-Fi receiver AW2000/10 — <https://www.philips.co.uk/c-p/AW2000_10/fidelio-a2-wireless-hi-fi-receiver>
 21. What Hi-Fi, IFA 2012: Philips expands Fidelio wireless hi-fi range (A1/A2) — <https://www.whathifi.com/news/ifa-2012-philips-expands-fidelio-wireless-hi-fi-range>
+22. Philips AW5000 user manual, appendix 2 "Understand meanings of LED colors" (ManualsLib, p. 31) — <https://www.manualslib.com/manual/500416/Philips-Aw5000.html?page=31>
 
 Music Assistant code references reflect the `dev` branch as of October 2026.
 

@@ -2,25 +2,31 @@
 # radio_diag.sh - diagnose (and if hung, try to recover) the Philips Fidelio/Streamium
 # DLNA radios, and collect HA + Music Assistant logs. Run in the Advanced SSH & Web Terminal.
 #   /homeassistant/radio_diag.sh                  diagnose all, recover radios found HUNG, logs of last 30 min
+#                                                 (a hung player: saves connections + MA log, restarts the MA container)
 #   /homeassistant/radio_diag.sh --minutes 90     longer log window
 #   /homeassistant/radio_diag.sh --recover Kitchen force recovery attempts on the radio "Kitchen"
 #   /homeassistant/radio_diag.sh --no-recover     diagnose only (read-only)
 #   /homeassistant/radio_diag.sh --discover       full SSDP discovery (60 s) before diagnosing
 #   /homeassistant/radio_diag.sh --capture 120    also record the radios' traffic for 120 s (tcpdump)
 #   /homeassistant/radio_diag.sh --ha-debug on    switch HA debug logging for DLNA/UPnP on (or off), then diagnose
-#   further options: --no-logs  --no-ssdp  --no-discover  --no-zip
+#   further options: --no-logs  --no-ssdp  --no-discover  --no-zip  --no-ma-restart
 # Radios: "name address" lines in $RADIO_DIAG_CONF (default /homeassistant/radio_diag.conf).
 #   Created/updated automatically by discovery; entries not seen are kept, so a hung radio that no
 #   longer announces itself is still diagnosed with its last known address.
 # Results: /homeassistant/radio_diag/<date-time>/ (report.txt, logs, raw responses) and <date-time>.zip
 # States: OK, STUCK (PLAYING with frozen position, LED off: a Stop was refused with UPnP error 701
-#   while the stream connection stayed open; a second Stop clears it), UPNP-SILENT/HUNG, OFFLINE.
+#   while the stream connection stayed open; a second Stop clears it), STALE-STREAM (STOPPED, but MA's
+#   stream connection is still open), HUNG-PLAYER (UPnP answers, port 8889 silent, Play fails with 501
+#   without fetching the stream; closing MA's stream connection cleared it), UPNP-SILENT/HUNG, OFFLINE.
+#   Restarting MA stops whatever it is playing on the other speakers too.
 
 CONF=${RADIO_DIAG_CONF:-/homeassistant/radio_diag.conf}
 RADIOS=()
 MA_SLUG=d5369777_music_assistant
 UPNP_PORT=49153
 VENDOR_PORT=8889
+MA_STREAM_PORT=${RADIO_DIAG_MA_PORT:-8097}   # Music Assistant's stream server
+MA_RESTART=1
 BLOCK_GRACE=45   # UPnP normally blocks up to ~30 s (wake from long standby, failed stream)
 MINUTES=30; RECOVER=1; FORCE=""; DO_LOGS=1; DO_SSDP=1; DISCOVER=quick; CAPTURE=0; HA_DEBUG=""; DO_ZIP=1
 PATCH_SCRIPT=/homeassistant/ma_patch_pr327.sh
@@ -38,6 +44,7 @@ while [ $# -gt 0 ]; do
     --capture) CAPTURE=$2; shift ;;
     --ha-debug) HA_DEBUG=$2; shift ;;
     --no-zip) DO_ZIP=0 ;;
+    --no-ma-restart) MA_RESTART=0 ;;
     -h|--help) awk 'NR > 1 && /^#/ { print; next } NR > 1 { exit }' "$0"; exit 0 ;;
     *) echo "unknown option: $1"; exit 2 ;;
   esac
@@ -66,9 +73,13 @@ ha_api() {  # path [json body -> POST]
     curl -s -m 15 -H "Authorization: Bearer $SUPERVISOR_TOKEN" "http://supervisor/core/api/$1"
   fi
 }
+all_conns() { ss -tn 2>/dev/null || netstat -tn 2>/dev/null; }
 conns() {  # ip -> TCP connections between this host (HA, MA, ...) and the radio
-  { ss -tn 2>/dev/null || netstat -tn 2>/dev/null; } | grep -E "[ :]$(echo "$1" | sed 's/\./\\./g'):[0-9]+( |$)" \
+  all_conns | grep -E "[ :]$(echo "$1" | sed 's/\./\\./g'):[0-9]+( |$)" \
     | awk '{print "      " $0}'
+}
+ma_stream_conn() {  # ip -> the radio's open connection to MA's stream server, if any
+  conns "$1" | grep -E "ESTAB.*:$MA_STREAM_PORT[[:space:]]" | head -1
 }
 
 # --- requests to the radios: one at a time, never with a timeout below 10 s ------------
@@ -95,7 +106,7 @@ tcp() {
   case $? in 0) echo open ;; 124) echo TIMEOUT ;; *) echo "refused/unreachable" ;; esac
 }
 
-declare -A STATUS
+declare -A STATUS STREAM_CONN
 diagnose() {  # name ip
   local n=$1 ip=$2 p d drc vs s1 st pos1
   say "=== $n ($ip)"
@@ -148,6 +159,17 @@ diagnose() {  # name ip
   say "  TCP connections with this host:"
   conns "$ip" | tee "$OUT/$n-connections.txt"
   [ -s "$OUT/$n-connections.txt" ] || say "      none"
+  if [ "$s1" = 0 ]; then
+    if [ "$vs" != 0 ]; then
+      STATUS[$n]="VENDOR-SILENT"
+    elif [ "${STATUS[$n]}" = OK ]; then
+      case "$st" in
+        STOPPED|NO_MEDIA_PRESENT)
+          STREAM_CONN[$n]=$(ma_stream_conn "$ip")
+          [ -n "${STREAM_CONN[$n]}" ] && STATUS[$n]="STREAM-OPEN" ;;
+      esac
+    fi
+  fi
   say "  -> ${STATUS[$n]}"
 }
 
@@ -164,6 +186,38 @@ recover_stuck() {  # name ip: a Stop refused with 701 leaves PLAYING; a second S
       return 0
     fi
   done
+  return 1
+}
+
+restart_ma() {  # saves the evidence, then restarts MA in place (a recreated container would lose a patched library)
+  local c
+  { date; all_conns; } > "$OUT/connections_before_ma_restart.txt"
+  say "=== RECOVERY: restarting Music Assistant to close its open stream connection"
+  say "  TCP connections saved to connections_before_ma_restart.txt"
+  ha apps logs $MA_SLUG -n 50000 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | redact > "$OUT/music_assistant_before_restart.log"
+  c=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -E "^(app|addon)_${MA_SLUG}$" | head -1)
+  if [ -n "$c" ] && docker restart "$c" >/dev/null 2>&1; then
+    say "  docker restart $c: done"
+  elif ha apps restart $MA_SLUG >/dev/null 2>&1; then
+    say "  ha apps restart $MA_SLUG: done (container recreated; a patched library must be patched again)"
+  else
+    say "  could not restart Music Assistant"
+    return 1
+  fi
+  sleep 10
+  { date; all_conns; } > "$OUT/connections_after_ma_restart.txt"
+}
+verify_player() {  # name ip: port 8889 answers and MA's stream connection is gone (Play itself is not tested)
+  local n=$1 ip=$2 i
+  for i in 1 2 3 4 5 6; do
+    vendor "$ip" HOMESTATUS
+    if [ "$VENDOR_RC" = 0 ] && [ -z "$(ma_stream_conn "$ip")" ]; then
+      say "  $n: port $VENDOR_PORT answers, MA's stream connection is gone ($VENDOR_BODY)"
+      return 0
+    fi
+    [ $i -lt 6 ] && sleep 15
+  done
+  say "  $n: port $VENDOR_PORT: $(rcdesc "$VENDOR_RC"); MA stream connection: $(ma_stream_conn "$ip" | awk '{print $NF}')"
   return 1
 }
 
@@ -311,8 +365,13 @@ fi
 if [ -x "$PATCH_SCRIPT" ] && command -v docker >/dev/null 2>&1; then
   for t in ma ha; do
     "$PATCH_SCRIPT" status $t > "$OUT/patch_pr327_$t.txt" 2>&1 < /dev/null
-    say "async_upnp_client #327 patch ($t): $(grep -m1 'async_upnp_client [0-9]' "$OUT/patch_pr327_$t.txt" | cut -d' ' -f2)," \
-        "$(tail -n 1 "$OUT/patch_pr327_$t.txt")"
+    v=$(grep -m1 'async_upnp_client [0-9]' "$OUT/patch_pr327_$t.txt" | cut -d' ' -f2)
+    if awk -v v="$v" 'BEGIN { split(v, a, "."); exit !(a[1] > 0 || a[2] >= 49) }'; then
+      say "async_upnp_client ($t): $v, includes the fix (#327), no patch needed"
+    else
+      say "async_upnp_client ($t): $v, $(tail -n 1 "$OUT/patch_pr327_$t.txt")"
+      grep -q 'NOT applied' "$OUT/patch_pr327_$t.txt" && say "    re-apply the fix: $PATCH_SCRIPT apply $t (an update of the app removes it)"
+    fi
   done
 fi
 free -m 2>/dev/null | sed 's/^/    /'
@@ -339,6 +398,34 @@ if [ ${#silent[@]} -gt 0 ]; then
       vendor "$2" HOMESTATUS
       if [ $VENDOR_RC = 0 ]; then STATUS[$1]="HUNG: UPnP dead, vendor :8889 alive ($VENDOR_BODY)"
       else STATUS[$1]="HUNG: UPnP and vendor :8889 dead"; fi
+    fi
+    say "$1 -> ${STATUS[$1]}"
+  done
+fi
+
+later=()
+for r in "${RADIOS[@]}"; do
+  set -- $r
+  case "${STATUS[$1]}" in VENDOR-SILENT|STREAM-OPEN) later+=("$r") ;; esac
+done
+if [ ${#later[@]} -gt 0 ]; then
+  say "re-checking ${later[*]} in ${BLOCK_GRACE}s, to rule out a short block or a connection in passing"
+  sleep $BLOCK_GRACE
+  for r in "${later[@]}"; do
+    set -- $r
+    vendor "$2" HOMESTATUS
+    soap "$2" AVTransport GetTransportInfo
+    if [ "${STATUS[$1]}" = VENDOR-SILENT ]; then
+      if [ "$VENDOR_RC" != 0 ]; then
+        STATUS[$1]="HUNG-PLAYER: UPnP answers, port $VENDOR_PORT silent (LED off? Play likely fails with 501)"
+      else
+        STATUS[$1]="OK after port $VENDOR_PORT was silent for a while"
+      fi
+    elif [ -n "${STREAM_CONN[$1]}" ] && [ "$(ma_stream_conn "$2")" = "${STREAM_CONN[$1]}" ] \
+         && [ "$(xml CurrentTransportState)" != PLAYING ] && [ "$(xml CurrentTransportState)" != PAUSED_PLAYBACK ]; then
+      STATUS[$1]="STALE-STREAM: $(xml CurrentTransportState), but MA's stream connection stays open (LED off?)"
+    else
+      STATUS[$1]="OK"
     fi
     say "$1 -> ${STATUS[$1]}"
   done
@@ -378,12 +465,20 @@ elif [ $DO_SSDP = 1 ]; then
   say "--- python3 not available, SSDP check skipped"
 fi
 
+ma_fix=()
 if [ $RECOVER = 1 ]; then
   for r in "${RADIOS[@]}"; do
     set -- $r
+    if [ -z "$FORCE" ]; then
+      case "${STATUS[$1]}" in HUNG-PLAYER*|STALE-STREAM*) ma_fix+=("$r"); continue ;; esac
+    fi
     if [ -z "$FORCE" ] && [ "${STATUS[$1]#STUCK}" != "${STATUS[$1]}" ]; then
-      if recover_stuck "$1" "$2"; then STATUS[$1]="${STATUS[$1]} -> cleared by a second Stop"
-      else STATUS[$1]="${STATUS[$1]} -> still PLAYING after 3 Stops"; fi
+      if recover_stuck "$1" "$2"; then
+        STATUS[$1]="${STATUS[$1]} -> cleared by a second Stop"
+        [ -n "$(ma_stream_conn "$2")" ] && ma_fix+=("$r")
+      else
+        STATUS[$1]="${STATUS[$1]} -> still PLAYING after 3 Stops"
+      fi
       continue
     fi
     if [ -n "$FORCE" ]; then [ "$1" = "$FORCE" ] || continue
@@ -391,6 +486,24 @@ if [ $RECOVER = 1 ]; then
     if recover "$1" "$2"; then STATUS[$1]="${STATUS[$1]} -> RECOVERED by software"
     else STATUS[$1]="${STATUS[$1]} -> NOT recovered, power cycle needed"; fi
   done
+  restart=()
+  for r in "${ma_fix[@]}"; do
+    set -- $r
+    if [ -n "$(ma_stream_conn "$2")" ]; then restart+=("$r")
+    else STATUS[$1]="${STATUS[$1]} -> no MA stream connection to close; power cycle needed"; fi
+  done
+  if [ ${#restart[@]} -gt 0 ] && [ $MA_RESTART = 1 ] && restart_ma; then
+    for r in "${restart[@]}"; do
+      set -- $r
+      if verify_player "$1" "$2"; then STATUS[$1]="${STATUS[$1]} -> cleared by restarting MA (Play not tested yet)"
+      else STATUS[$1]="${STATUS[$1]} -> NOT cleared by restarting MA, power cycle needed"; fi
+    done
+  else
+    for r in "${restart[@]}"; do
+      set -- $r
+      STATUS[$1]="${STATUS[$1]} -> not restarted; MA must close its stream connection"
+    done
+  fi
 fi
 
 if [ $DO_LOGS = 1 ]; then
@@ -427,6 +540,16 @@ fi
 
 say "=== SUMMARY"
 for r in "${RADIOS[@]}"; do set -- $r; say "    $1 ($2): ${STATUS[$1]}"; done
+for r in "${RADIOS[@]}"; do
+  set -- $r
+  case "${STATUS[$1]}" in
+    HUNG-PLAYER*|STALE-STREAM*)
+      case "${STATUS[$1]}" in *" -> cleared"*|*"by restarting MA"*) continue ;; esac
+      say "hint for $1: check with: ss -tn | grep $2  - if a connection to port $MA_STREAM_PORT is open, restart MA"
+      say "    (docker restart app_$MA_SLUG) before power-cycling the speaker"
+      ;;
+  esac
+done
 if [ -n "${CAP_PID:-}" ]; then
   say "waiting for the packet capture to finish..."; wait "$CAP_PID" 2>/dev/null
   say "    radios.pcap: $(du -h "$OUT/radios.pcap" 2>/dev/null | cut -f1)"
