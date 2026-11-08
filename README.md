@@ -32,6 +32,7 @@ attributable to Wi-Fi reception. ✔
 |---|---|---|
 | Formats | Philips lists MP3, WMA, AAC/m4a, eAAC+, FLAC, ALAC, L-PCM; 32/44.1/48/96 kHz [1][2]; FLAC "below 96 kHz and 16 bit" [3]; aggregator sites also list OGG [13] | Test matrix per format, rate and bit depth: 24-bit unusable in every format; above 48 kHz only AAC works; L16 at 48 kHz plays at the wrong speed; `audio/flac` and `audio/L24` are rejected; eAAC+ decodes but fails as a low-bitrate live stream; OGG Vorbis/Opus and playlists unsupported; mono L16 plays at double speed; MIME aliases (§5) |
 | Start latency | – | Fixed byte thresholds per codec; the **Play reply is held back** until audio plays (§4.2) |
+| Clip edges | – | The last 0.69 s of every stream and the first 0.05–0.10 s are not played (§4.6) |
 | Pause | – | Enabled only by `DLNA.ORG_OP=01` in the DIDL protocolInfo; resume continues on the same connection; Seek unsupported (§4.2) |
 | Standby | – | Auto-standby after 10 min (restarted by commands, not by polling); wake-up adds 0.3–1.9 s (§4.3) |
 | HTTP streaming | MIME `audio/x-flac` needed for FLAC on a Streamium NP2500 [6]; A9: "needs a proxy for online content" [11] | Request pattern, framing support, no ICY; remote HTTP works, but no HTTPS, no redirects, no Icecast/SHOUTcast framing, so internet radio needs a proxy (§4.4, §4.5) |
@@ -304,6 +305,27 @@ to an A5: ✔
 - One earlier test sent 120 kB as a single chunk, the terminating chunk 30 ms later, connection open:
   it played (1 attempt). ◐
 
+**Audio lost at the start and end.** The renderer does not play the **last 0.69 s (±0.01 s)** of a
+stream, and usually not the **first 0.05–0.10 s**. Measured on one A5 by ear, with files sent with an
+exact `Content-Length` (MP3, 44.1 kHz stereo), each containing a short 1 kHz beep at a known distance
+from the end or the start; the positions were played in shuffled order and checked against a key
+afterwards: ✔
+
+| Beep | Heard |
+|---|---|
+| 20 ms, ending 0.68–0.74 s before the end | 16 of 16 plays (one ending 0.68 s before the end sounded shorter) |
+| 20 ms, ending 0.62–0.66 s before the end | 0 of 13 plays |
+| 30 ms, ending 0.67 s before the end | partly (1 play) |
+| 50 ms, starting 0.1–0.5 s after the start | 30 of 30 plays |
+| 50 ms, starting at 0.0 s | 0 of 6 plays |
+
+- The end loss is the same at 320 and 128 kbit/s (a spoken count stopped at the same number), so it is
+  a fixed time, not a fixed amount of data. With 1 s of silence appended, everything was heard. ✔
+- The renderer reports `STOPPED` on its own; no controller command is involved. A Music Assistant
+  announcement whose last word ends 0.2 s before the end of the stream loses that word. ✔
+- Once in about 90 plays, about 0.4 s was lost at the start (a spoken word starting at 0.24 s was
+  heard only from 0.42 s on). ◐
+
 ---
 
 ## 5. Format support (UPnP streaming, A5; A3 identical where tested)
@@ -482,6 +504,7 @@ announcement failure and its follow-on failure in §4.6 are candidates.
 | Hand the renderer a final `http://` URL (resolve redirects, no HTTPS) or proxy the stream | §4.5 |
 | Listen to SSDP NOTIFY rather than relying on M-SEARCH only | §3; Music Assistant searches every 300 s only [10] |
 | Close the connection when a stream ends; don't leave it open after the terminating chunk | §4.6: otherwise a short stream such as an announcement often never starts (Play 501 after 30 s, LED blinking), and a `Stop` after a stalled stream gets UPnP error 701 and the renderer stays stuck (LED off) |
+| End every stream with at least 1 s of silence, and start short clips with about 0.5 s | §4.6: the last 0.69 s and the first 0.05–0.10 s (rarely about 0.4 s) are not played; announcements lose their last word |
 | Send a UPnP `Pause` when the source pauses, instead of letting the stream run dry; and send `Stop` again after error 701 | §4.2, §4.6 |
 | As a user: when the LED is off or keeps blinking and `Play` fails, check `ss -tn` for an open connection from the speaker to the controller and restart the controller before power-cycling the speaker | §4.6, §7 |
 
@@ -510,6 +533,9 @@ Music Assistant 2.10.9 still pins 0.48.0 and is affected. ✔
 - Why the renderer misses the end of a short stream in some attempts but not in others (§4.6), and
   what causes the follow-on failure (`HEAD` without `GET`); it resembles the lock-up, where Play also
   failed without fetching the stream.
+- The audio lost at the end (§4.6): whether it is a fixed time or a number of MP3 frames (0.69 s is
+  about 26 frames at 44.1 kHz; a test at another sample rate would tell), whether chunked streams and
+  other formats lose the same, and whether the A3 and other A5 units behave the same.
 - After the lock-up, `/ELAPSE` reported volume 29 while UPnP `GetVolume` reported 16 (they normally
   match).
 - A1, A2 and A9: untested. A1/A2 likely behave like A3/A5 as renderers; firmware H5.10S was released jointly for AW9000, AW5000, AW3000,
