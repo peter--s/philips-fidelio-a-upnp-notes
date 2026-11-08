@@ -38,7 +38,7 @@ attributable to Wi-Fi reception. ✔
 | Twonky quirk flags for the Fidelio A9 [11] | `SUBSCRIBE_TWICE`, `POLL_AVT_STATE`, `NEEDS_STOP_4_AV`, `IGNORE_STOP_AFTER_PLAY`, `ACCEPT_SAME_SEQ`, seek flags | None of these behaviours observed on the A5; Seek unsupported anyway (§4.1, §4.2) |
 | SSDP | – | Announcement interval and origin, boot sequence (§3) |
 | Vendor API :8889 | Paths for standby, volume, sources used by homebridge-fidelio [5] | Response formats, **bass/treble control**, further settings, Wi-Fi status, no auto-standby setting (§6) |
-| Robustness | Users report occasional lock-ups needing a power cycle | Not reproducible by load, parallelism, dead subscribers, abandoned requests or standby wake-ups; a stuck state caused by a stream ended without closing the connection; one field lock-up captured and cleared without a power cycle by closing Music Assistant's stream connection (§4.6, §7) |
+| Robustness | Users report occasional lock-ups needing a power cycle | Not reproducible by load, parallelism, dead subscribers, abandoned requests or standby wake-ups; a stuck state caused by a stream ended without closing the connection; short streams (announcements) that often never start while the controller keeps the connection open; one field lock-up captured and cleared without a power cycle by closing Music Assistant's stream connection (§4.6, §7) |
 | Status LED | Manual: colours for setup, standby, mute | Blink rate separates buffering from mute; LED off marks the stuck/hung state (§4.6) |
 | Controller interaction | – | Why Music Assistant's DLNA provider times out on these devices (§8) |
 
@@ -145,6 +145,8 @@ intervals. Listening to NOTIFY is more reliable.
 - If the first audio byte is delayed, the Play reply comes after delay + about 4 s; tested up to a
   12 s delay. ✔
 - If the threshold is never reached, Play fails after about **30 s** with **HTTP 500 / UPnP error 501**. ✔
+- A stream that ends below the threshold starts when the renderer recognises its end, which it does
+  not always do while the connection stays open (§4.6).
 - **Pause depends only on the DIDL metadata**: the renderer offers and accepts `Pause` only if the
   `res@protocolInfo` 4th field passed with SetAVTransportURI contains **`DLNA.ORG_OP=01`**, e.g.
   `http-get:*:audio/mpeg:DLNA.ORG_PN=MP3;DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000`. ✔
@@ -253,7 +255,7 @@ The power button LED, as documented [22] and as observed (A5):
 | LED | Meaning |
 |---|---|
 | solid white | on, ready or playing |
-| blinking white, about 1 Hz | buffering: at start, and whenever the stream delivers no data (observed) |
+| blinking white, about 1 Hz | buffering: at start, whenever the stream delivers no data, and while waiting for the end of a short stream it missed (observed) |
 | blinking white, about 0.5 Hz | muted (manual: "blinking white") |
 | solid green | standby |
 | **off** | the stuck state below, and the field lock-up in §7 (observed; not in the manual) |
@@ -279,6 +281,28 @@ normally (the last data was played). ✔
   the audio, 20 s later Music Assistant reports the source as stalled, sends the last data and the
   terminating chunk, keeps the connection open despite its own `Connection: close` header, and sends
   `Stop` (packet capture). ✔
+
+**Short streams (announcements).** A stream that ends below the start threshold (§4.2) can start only
+once the renderer recognises its end. Test: two Music Assistant announcement streams from a packet
+capture (4.9 s MP3 at 320 kbit/s, about 195 kB, sent within 0.3 s, one MP3 frame per chunk, the
+terminating chunk in a separate packet 5 ms later), replayed byte for byte with their captured timing
+to an A5: ✔
+
+| After the terminating chunk | Result |
+|---|---|
+| connection kept open (as Music Assistant does) | 2 of 7 played; the renderer closed the connection 70–80 ms after the terminating chunk. **5 of 7 never started**: all data and the terminating chunk acknowledged, then nothing; `STOPPED`, `/ELAPSE` `play:1`, LED blinking, Play failed after 30 s (501). Each of the two streams played in some attempts and failed in others, so neither the content nor the length decides it |
+| connection closed by the server | 2 of 2 played, Play reply 1.4 s (attempts that fetched the stream; see the follow-on failure below) |
+| connection closed 6 s after a failed start | the renderer played the whole announcement, starting within 3 s (5 of 5) |
+
+- A field failure looked the same: of three Music Assistant announcements about 40 s apart, the third
+  never started, and the renderer stayed in this state (`STOPPED`, LED blinking, Music Assistant's
+  connection open and idle, port 8889 answering) for more than 30 minutes. ✔
+- **Follow-on failure:** after such a late close, with a `Stop` sent during the late playback, the next
+  Play made the renderer send only the `HEAD`, never the `GET`, and Play failed after 30 s (501),
+  4 of 4 times, including attempts in which the server would have closed the connection. The attempt
+  after that fetched the stream again. ✔
+- One earlier test sent 120 kB as a single chunk, the terminating chunk 30 ms later, connection open:
+  it played (1 attempt). ◐
 
 ---
 
@@ -434,7 +458,8 @@ cycle). It looked different from the candidate above: ✔
 | Music Assistant's stream connection to the renderer | still open, no traffic |
 
 Preceding it: two Music Assistant announcements 37 s apart, with a library that re-sent timed-out
-commands (§8), then timeouts of `play_media` and `volume_set`. The trigger is not established.
+commands (§8), then timeouts of `play_media` and `volume_set`. The trigger is not established; the
+announcement failure and its follow-on failure in §4.6 are candidates.
 - `Stop`, a working stream, and closing the connection on the controller host with `ss -K` (not
   supported there) did not help.
 - **Restarting Music Assistant** closed its connection: the LED came on, port 8889 answered again, and a
@@ -456,9 +481,9 @@ commands (§8), then timeouts of `play_media` and `volume_set`. The trigger is n
 | To get a working Pause, put `DLNA.ORG_OP=01` into the DIDL `protocolInfo`, and keep the HTTP stream open (and buffered) while paused; don't use Seek | §4.2 |
 | Hand the renderer a final `http://` URL (resolve redirects, no HTTPS) or proxy the stream | §4.5 |
 | Listen to SSDP NOTIFY rather than relying on M-SEARCH only | §3; Music Assistant searches every 300 s only [10] |
-| Close the connection when a stream ends; don't leave it open after the terminating chunk | §4.6: a `Stop` then gets UPnP error 701 and the renderer stays stuck (LED off) |
+| Close the connection when a stream ends; don't leave it open after the terminating chunk | §4.6: otherwise a short stream such as an announcement often never starts (Play 501 after 30 s, LED blinking), and a `Stop` after a stalled stream gets UPnP error 701 and the renderer stays stuck (LED off) |
 | Send a UPnP `Pause` when the source pauses, instead of letting the stream run dry; and send `Stop` again after error 701 | §4.2, §4.6 |
-| As a user: when the LED is off and `Play` fails, check `ss -tn` for an open connection from the speaker to the controller and restart the controller before power-cycling the speaker | §7 |
+| As a user: when the LED is off or keeps blinking and `Play` fails, check `ss -tn` for an open connection from the speaker to the controller and restart the controller before power-cycling the speaker | §4.6, §7 |
 
 ### async_upnp_client (used by Home Assistant `dlna_dmr` and Music Assistant)
 Both create `AiohttpSessionRequester(session, with_sleep=True)` with the library default timeout of
@@ -482,6 +507,9 @@ Music Assistant 2.10.9 still pins 0.48.0 and is affected. ✔
 - The trigger of the field lock-up (§7), whether every lock-up shows the same signature (UPnP alive, port
   8889 silent, controller connection open), and whether restarting the controller clears it every time.
   `tools/radio_diag.sh` detects this state and tries that recovery.
+- Why the renderer misses the end of a short stream in some attempts but not in others (§4.6), and
+  what causes the follow-on failure (`HEAD` without `GET`); it resembles the lock-up, where Play also
+  failed without fetching the stream.
 - After the lock-up, `/ELAPSE` reported volume 29 while UPnP `GetVolume` reported 16 (they normally
   match).
 - A1, A2 and A9: untested. A1/A2 likely behave like A3/A5 as renderers; firmware H5.10S was released jointly for AW9000, AW5000, AW3000,

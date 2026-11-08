@@ -16,7 +16,8 @@
 # Results: /homeassistant/radio_diag/<date-time>/ (report.txt, logs, raw responses) and <date-time>.zip
 # States: OK, STUCK (PLAYING with frozen position, LED off: a Stop was refused with UPnP error 701
 #   while the stream connection stayed open; a second Stop clears it), STALE-STREAM (STOPPED, but MA's
-#   stream connection is still open), HUNG-PLAYER (UPnP answers, port 8889 silent, Play fails with 501
+#   stream connection is still open; LED blinking when a short stream such as an announcement never
+#   started, or off), HUNG-PLAYER (UPnP answers, port 8889 silent, Play fails with 501
 #   without fetching the stream; closing MA's stream connection cleared it), UPNP-SILENT/HUNG, OFFLINE.
 #   Restarting MA stops whatever it is playing on the other speakers too.
 
@@ -423,7 +424,7 @@ if [ ${#later[@]} -gt 0 ]; then
       fi
     elif [ -n "${STREAM_CONN[$1]}" ] && [ "$(ma_stream_conn "$2")" = "${STREAM_CONN[$1]}" ] \
          && [ "$(xml CurrentTransportState)" != PLAYING ] && [ "$(xml CurrentTransportState)" != PAUSED_PLAYBACK ]; then
-      STATUS[$1]="STALE-STREAM: $(xml CurrentTransportState), but MA's stream connection stays open (LED off?)"
+      STATUS[$1]="STALE-STREAM: $(xml CurrentTransportState), but MA's stream connection stays open (LED blinking or off?)"
     else
       STATUS[$1]="OK"
     fi
